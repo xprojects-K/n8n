@@ -1,6 +1,7 @@
-import { Logger } from '@n8n/backend-common';
+import { Logger, parseFlatted } from '@n8n/backend-common';
 import { GlobalConfig } from '@n8n/config';
 import { Service } from '@n8n/di';
+import { hasGlobalScope } from '@n8n/permissions';
 import type {
 	FindManyOptions,
 	FindOneOptions,
@@ -17,45 +18,57 @@ import {
 	LessThanOrEqual,
 	MoreThanOrEqual,
 	Not,
-	Raw,
 	Repository,
+	And,
 } from '@n8n/typeorm';
 import { DateUtils } from '@n8n/typeorm/util/DateUtils';
-import { parse, stringify } from 'flatted';
+import { stringify } from 'flatted';
 import pick from 'lodash/pick';
 import { BinaryDataService, ErrorReporter } from 'n8n-core';
-import { ExecutionCancelledError, UnexpectedError } from 'n8n-workflow';
 import type {
 	AnnotationVote,
 	ExecutionStatus,
 	ExecutionSummary,
 	IRunExecutionData,
+	IRunExecutionDataAll,
+} from 'n8n-workflow';
+import {
+	CRASHABLE_EXECUTION_STATUSES,
+	migrateRunExecutionData,
+	UnexpectedError,
 } from 'n8n-workflow';
 
-import { ExecutionDataRepository } from './execution-data.repository';
 import {
+	AnnotationTagEntity,
+	AnnotationTagMapping,
+	ExecutionAnnotation,
+	ExecutionData,
+	ExecutionDataStorageLocation,
 	ExecutionEntity,
 	ExecutionMetadata,
-	ExecutionData,
-	ExecutionAnnotation,
-	AnnotationTagMapping,
-	WorkflowEntity,
 	SharedWorkflow,
-	AnnotationTagEntity,
+	WorkflowEntity,
 } from '../entities';
+import { SharedWorkflowRepository } from './shared-workflow.repository';
 import type {
-	CreateExecutionPayload,
-	IExecutionFlattedDb,
-	IExecutionBase,
-	IExecutionResponse,
 	ExecutionSummaries,
+	IExecutionBase,
+	IExecutionFlattedDb,
+	IExecutionResponse,
 } from '../entities/types-db';
+import { applyWorkflowBooleanSettingFilter } from '../utils/apply-workflow-boolean-setting-filter';
 import { separate } from '../utils/separate';
 
 class PostgresLiveRowsRetrievalError extends UnexpectedError {
 	constructor(rows: unknown) {
 		super('Failed to retrieve live execution rows in Postgres', { extra: { rows } });
 	}
+}
+
+export interface UpdateExecutionConditions {
+	requireStatus?: ExecutionStatus;
+	requireNotFinished?: boolean;
+	requireNotCanceled?: boolean;
 }
 
 export interface IGetExecutionsQueryFilter {
@@ -68,10 +81,19 @@ export interface IGetExecutionsQueryFilter {
 	workflowId?: string;
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	waitTill?: FindOperator<any> | boolean;
-	metadata?: Array<{ key: string; value: string }>;
+	metadata?: Array<{ key: string; value: string; exactMatch?: boolean }>;
 	startedAfter?: string;
 	startedBefore?: string;
 }
+
+export type ExecutionDeletionCriteria = {
+	filters: IGetExecutionsQueryFilter | undefined;
+	accessibleWorkflowIds: string[];
+	deleteConditions: {
+		deleteBefore?: Date;
+		ids?: string[];
+	};
+};
 
 function parseFiltersToQueryBuilder(
 	qb: SelectQueryBuilder<ExecutionEntity>,
@@ -88,7 +110,11 @@ function parseFiltersToQueryBuilder(
 	if (filters?.metadata) {
 		qb.leftJoin(ExecutionMetadata, 'md', 'md.executionId = execution.id');
 		for (const md of filters.metadata) {
-			qb.andWhere('md.key = :key AND md.value = :value', md);
+			if (md.exactMatch) {
+				qb.andWhere('md.key = :key AND md.value = :value', md);
+			} else {
+				qb.andWhere('md.key = :key AND LOWER(md.value) LIKE LOWER(:value)', md);
+			}
 		}
 	}
 	if (filters?.startedAfter) {
@@ -120,6 +146,10 @@ const moreThanOrEqual = (date: string): unknown => {
 	return MoreThanOrEqual(DateUtils.mixedDateToUtcDatetimeString(new Date(date)));
 };
 
+// This is the max number of elements in an IN-clause.
+// It's a conservative value, as some databases indicate limits around 1000.
+const MAX_UPDATE_BATCH_SIZE = 900;
+
 @Service()
 export class ExecutionRepository extends Repository<ExecutionEntity> {
 	private hardDeletionBatchSize = 100;
@@ -129,8 +159,8 @@ export class ExecutionRepository extends Repository<ExecutionEntity> {
 		private readonly globalConfig: GlobalConfig,
 		private readonly logger: Logger,
 		private readonly errorReporter: ErrorReporter,
-		private readonly executionDataRepository: ExecutionDataRepository,
 		private readonly binaryDataService: BinaryDataService,
+		private readonly sharedWorkflowRepository: SharedWorkflowRepository,
 	) {
 		super(ExecutionEntity, dataSource.manager);
 	}
@@ -164,9 +194,7 @@ export class ExecutionRepository extends Repository<ExecutionEntity> {
 		},
 	): Promise<IExecutionFlattedDb[] | IExecutionResponse[] | IExecutionBase[]> {
 		if (options?.includeData) {
-			if (!queryParams.relations) {
-				queryParams.relations = [];
-			}
+			queryParams.relations ??= [];
 
 			if (Array.isArray(queryParams.relations)) {
 				queryParams.relations.push('executionData', 'metadata');
@@ -178,36 +206,29 @@ export class ExecutionRepository extends Repository<ExecutionEntity> {
 
 		const executions = await this.find(queryParams);
 
-		if (options?.includeData && options?.unflattenData) {
-			const [valid, invalid] = separate(executions, (e) => e.executionData !== null);
-			this.reportInvalidExecutions(invalid);
-			return valid.map((execution) => {
-				const { executionData, metadata, ...rest } = execution;
-				return {
-					...rest,
-					data: parse(executionData.data) as IRunExecutionData,
-					workflowData: executionData.workflowData,
-					customData: Object.fromEntries(metadata.map((m) => [m.key, m.value])),
-				} as IExecutionResponse;
-			});
-		} else if (options?.includeData) {
-			const [valid, invalid] = separate(executions, (e) => e.executionData !== null);
-			this.reportInvalidExecutions(invalid);
-			return valid.map((execution) => {
-				const { executionData, metadata, ...rest } = execution;
-				return {
-					...rest,
-					data: execution.executionData.data,
-					workflowData: execution.executionData.workflowData,
-					customData: Object.fromEntries(metadata.map((m) => [m.key, m.value])),
-				} as IExecutionFlattedDb;
-			});
+		const [valid, invalid] = separate(executions, (e) => e.executionData !== null);
+		this.reportInvalidExecutions(invalid);
+
+		if (!options?.includeData) {
+			// No data to include, so we exclude it and return early.
+			return executions.map((execution) => {
+				const { executionData, ...rest } = execution;
+				return rest;
+			}) as IExecutionFlattedDb[] | IExecutionResponse[] | IExecutionBase[];
 		}
 
-		return executions.map((execution) => {
-			const { executionData, ...rest } = execution;
-			return rest;
-		}) as IExecutionFlattedDb[] | IExecutionResponse[] | IExecutionBase[];
+		return (await Promise.all(
+			valid.map(async (execution) => {
+				const { executionData, metadata, ...rest } = execution;
+				const data = await this.handleExecutionRunData(executionData.data, options);
+				return {
+					...rest,
+					data,
+					workflowData: executionData.workflowData,
+					customData: Object.fromEntries(metadata.map((m) => [m.key, m.value])),
+				};
+			}),
+		)) as IExecutionFlattedDb[] | IExecutionResponse[] | IExecutionBase[];
 	}
 
 	reportInvalidExecutions(executions: ExecutionEntity[]) {
@@ -215,7 +236,9 @@ export class ExecutionRepository extends Repository<ExecutionEntity> {
 
 		this.errorReporter.error(
 			new UnexpectedError('Found executions without executionData', {
-				extra: { executionIds: executions.map(({ id }) => id) },
+				extra: {
+					executionIds: executions.map(({ id }) => id),
+				},
 			}),
 		);
 	}
@@ -304,95 +327,100 @@ export class ExecutionRepository extends Repository<ExecutionEntity> {
 			});
 		}
 
+		if (!options?.includeData) {
+			// Not including run data, so return early.
+			const { executionData, ...rest } = execution;
+			return {
+				...rest,
+				...(options?.includeAnnotation &&
+					serializedAnnotation && { annotation: serializedAnnotation }),
+			} as IExecutionFlattedDb | IExecutionResponse | IExecutionBase;
+		}
+
+		// Include the run data.
+		const data = await this.handleExecutionRunData(executionData.data, options);
 		return {
 			...rest,
-			...(options?.includeData && {
-				data: options?.unflattenData
-					? (parse(executionData.data) as IRunExecutionData)
-					: executionData.data,
-				workflowData: executionData?.workflowData,
-				customData: Object.fromEntries(metadata.map((m) => [m.key, m.value])),
-			}),
+			data,
+			workflowData: executionData.workflowData,
+			workflowVersionId: executionData.workflowVersionId ?? null,
+			customData: Object.fromEntries(metadata.map((m) => [m.key, m.value])),
 			...(options?.includeAnnotation &&
 				serializedAnnotation && { annotation: serializedAnnotation }),
 		} as IExecutionFlattedDb | IExecutionResponse | IExecutionBase;
 	}
 
-	/**
-	 * Insert a new execution and its execution data using a transaction.
-	 */
-	async createNewExecution(execution: CreateExecutionPayload): Promise<string> {
-		const { data: dataObj, workflowData: currentWorkflow, ...rest } = execution;
-		const { connections, nodes, name, settings } = currentWorkflow ?? {};
-		const workflowData = { connections, nodes, name, settings, id: currentWorkflow.id };
-		const data = stringify(dataObj);
-
-		const { type: dbType, sqlite: sqliteConfig } = this.globalConfig.database;
-		if (dbType === 'sqlite' && sqliteConfig.poolSize === 0) {
-			// TODO: Delete this block of code once the sqlite legacy (non-pooling) driver is dropped.
-			// In the non-pooling sqlite driver we can't use transactions, because that creates nested transactions under highly concurrent loads, leading to errors in the database
-			const { identifiers: inserted } = await this.insert({ ...rest, createdAt: new Date() });
-			const { id: executionId } = inserted[0] as { id: string };
-			await this.executionDataRepository.insert({ executionId, workflowData, data });
-			return String(executionId);
-		} else {
-			// All other database drivers should create executions and execution-data atomically
-			return await this.manager.transaction(async (transactionManager) => {
-				const { identifiers: inserted } = await transactionManager.insert(ExecutionEntity, {
-					...rest,
-					createdAt: new Date(),
-				});
-				const { id: executionId } = inserted[0] as { id: string };
-				await this.executionDataRepository.createExecutionDataForExecution(
-					{ executionId, workflowData, data },
-					transactionManager,
-				);
-				return String(executionId);
-			});
-		}
-	}
-
 	async markAsCrashed(executionIds: string | string[]) {
 		if (!Array.isArray(executionIds)) executionIds = [executionIds];
 
-		await this.update(
-			{ id: In(executionIds) },
-			{
-				status: 'crashed',
-				stoppedAt: new Date(),
-			},
-		);
-
-		this.logger.info('Marked executions as `crashed`', { executionIds });
-	}
-
-	/**
-	 * Permanently remove a single execution and its binary data.
-	 */
-	async hardDelete(ids: { workflowId: string; executionId: string }) {
-		return await Promise.all([
-			this.delete(ids.executionId),
-			this.binaryDataService.deleteMany([ids]),
-		]);
+		let processed: number = 0;
+		while (processed < executionIds.length) {
+			// NOTE: if a slice goes past the end of the array, it just returns up til the end.
+			const batch: string[] = executionIds.slice(processed, processed + MAX_UPDATE_BATCH_SIZE);
+			await this.update(
+				// Guard against overwriting executions that have since moved to a `waiting` or
+				// terminal status: recovery can race a `running` -> `waiting` transition and flag a
+				// healthy execution as dangling, but only genuinely in-progress rows should be crashed
+				{ id: In(batch), status: In(CRASHABLE_EXECUTION_STATUSES) },
+				{
+					status: 'crashed',
+					stoppedAt: new Date(),
+					waitTill: null,
+				},
+			);
+			this.logger.info('Marked executions as `crashed`', { executionIds });
+			processed += batch.length;
+		}
 	}
 
 	async setRunning(executionId: string) {
 		const startedAt = new Date();
 
-		await this.update({ id: executionId }, { status: 'running', startedAt });
+		return await this.manager.transaction(async (manager) => {
+			const existing = await manager.findOneBy(ExecutionEntity, { id: executionId });
 
-		return startedAt;
+			// Preserve original startedAt for resumed executions
+			const effectiveStartedAt = existing?.startedAt ?? startedAt;
+
+			await manager.update(
+				ExecutionEntity,
+				{ id: executionId },
+				{ status: 'running', startedAt: effectiveStartedAt, waitTill: null },
+			);
+
+			return effectiveStartedAt;
+		});
 	}
 
-	async updateExistingExecution(executionId: string, execution: Partial<IExecutionResponse>) {
+	/**
+	 * Update an existing execution in the database.
+	 *
+	 * @param executionId - The ID of the execution to update
+	 * @param execution - Partial execution data to update
+	 * @param conditions - Optional conditions that must be met for the update to proceed.
+	 *   `requireStatus`: only update if execution has this exact status.
+	 *   `requireNotFinished`: only update if `finished = false`.
+	 *   `requireNotCanceled`: only update if `status != 'canceled'`.
+	 *   Note: `requireStatus` and `requireNotCanceled` both constrain the `status` column,
+	 *   so combining them is not supported.
+	 * @returns true if update succeeded, false if no rows matched (execution not found or conditions not met)
+	 */
+	async updateExistingExecution(
+		executionId: string,
+		execution: Partial<IExecutionResponse>,
+		conditions?: UpdateExecutionConditions,
+	): Promise<boolean> {
 		const {
 			id,
 			data,
 			workflowId,
 			workflowData,
+			workflowVersionId, // must never change
 			createdAt, // must never change
 			startedAt, // must never change
 			customData,
+			jsonSizeBytes, // computed by ExecutionPersistence on write; never set from a caller here
+			binaryDataSizeBytes, // computed by ExecutionPersistence on write; never set from a caller here
 			...executionInformation
 		} = execution;
 
@@ -401,46 +429,40 @@ export class ExecutionRepository extends Repository<ExecutionEntity> {
 		if (workflowData) executionData.workflowData = workflowData;
 		if (data) executionData.data = stringify(data);
 
-		const { type: dbType, sqlite: sqliteConfig } = this.globalConfig.database;
-
-		if (dbType === 'sqlite' && sqliteConfig.poolSize === 0) {
-			// TODO: Delete this block of code once the sqlite legacy (non-pooling) driver is dropped.
-			// In the non-pooling sqlite driver we can't use transactions, because that creates nested transactions under highly concurrent loads, leading to errors in the database
-
+		return await this.manager.transaction(async (tx) => {
 			if (Object.keys(executionInformation).length > 0) {
-				await this.update({ id: executionId }, executionInformation);
+				const whereCondition: FindOptionsWhere<ExecutionEntity> = { id: executionId };
+				if (conditions?.requireStatus) whereCondition.status = conditions.requireStatus;
+				if (conditions?.requireNotFinished) whereCondition.finished = false;
+				if (conditions?.requireNotCanceled)
+					whereCondition.status = Not('canceled') as FindOperator<ExecutionStatus>;
+
+				const result = await tx.update(ExecutionEntity, whereCondition, executionInformation);
+				const executionTableAffectedRows = result.affected ?? 0;
+
+				// If conditions were set and the update failed, abort the
+				// transaction early and return false.
+				if (executionTableAffectedRows === 0) {
+					return false;
+				}
 			}
 
 			if (Object.keys(executionData).length > 0) {
-				// @ts-expect-error Fix typing
-				await this.executionDataRepository.update({ executionId }, executionData);
-			}
-
-			return;
-		}
-
-		// All other database drivers should update executions and execution-data atomically
-
-		await this.manager.transaction(async (tx) => {
-			if (Object.keys(executionInformation).length > 0) {
-				await tx.update(ExecutionEntity, { id: executionId }, executionInformation);
-			}
-
-			if (Object.keys(executionData).length > 0) {
-				// @ts-expect-error Fix typing
 				await tx.update(ExecutionData, { executionId }, executionData);
 			}
+
+			// Updates succeeded
+			return true;
 		});
 	}
 
-	async deleteExecutionsByFilter(
-		filters: IGetExecutionsQueryFilter | undefined,
-		accessibleWorkflowIds: string[],
-		deleteConditions: {
-			deleteBefore?: Date;
-			ids?: string[];
-		},
-	) {
+	async deleteExecutionsByFilter({
+		filters,
+		accessibleWorkflowIds,
+		deleteConditions,
+	}: ExecutionDeletionCriteria): Promise<
+		Array<{ executionId: string; workflowId: string; storedAt: ExecutionDataStorageLocation }>
+	> {
 		if (!deleteConditions?.deleteBefore && !deleteConditions?.ids) {
 			throw new UnexpectedError(
 				'Either "deleteBefore" or "ids" must be present in the request body',
@@ -448,7 +470,7 @@ export class ExecutionRepository extends Repository<ExecutionEntity> {
 		}
 
 		const query = this.createQueryBuilder('execution')
-			.select(['execution.id', 'execution.workflowId'])
+			.select(['execution.id', 'execution.workflowId', 'execution.storedAt'])
 			.andWhere('execution.workflowId IN (:...accessibleWorkflowIds)', { accessibleWorkflowIds });
 
 		if (deleteConditions.deleteBefore) {
@@ -471,22 +493,26 @@ export class ExecutionRepository extends Repository<ExecutionEntity> {
 					executionIds: deleteConditions.ids,
 				});
 			}
-			return;
+			return [];
 		}
 
-		const ids = executions.map(({ id, workflowId }) => ({
+		const refs = executions.map(({ id, workflowId, storedAt }) => ({
 			executionId: id,
 			workflowId,
+			storedAt,
 		}));
 
+		const toDelete = [...refs];
 		do {
 			// Delete in batches to avoid "SQLITE_ERROR: Expression tree is too large (maximum depth 1000)" error
-			const batch = ids.splice(0, this.hardDeletionBatchSize);
+			const batch = toDelete.splice(0, this.hardDeletionBatchSize);
 			await Promise.all([
 				this.delete(batch.map(({ executionId }) => executionId)),
-				this.binaryDataService.deleteMany(batch),
+				this.binaryDataService.deleteMany(batch.map((b) => ({ type: 'execution' as const, ...b }))),
 			]);
-		} while (ids.length > 0);
+		} while (toDelete.length > 0);
+
+		return refs;
 	}
 
 	async getIdsSince(date: Date) {
@@ -557,23 +583,25 @@ export class ExecutionRepository extends Repository<ExecutionEntity> {
 		const date = new Date();
 		date.setHours(date.getHours() - this.globalConfig.executions.pruneDataHardDeleteBuffer);
 
-		const workflowIdsAndExecutionIds = (
-			await this.find({
-				select: ['workflowId', 'id'],
-				where: {
-					deletedAt: LessThanOrEqual(DateUtils.mixedDateToUtcDatetimeString(date)),
-				},
-				take: this.hardDeletionBatchSize,
+		const results = await this.find({
+			select: ['workflowId', 'id', 'storedAt'],
+			where: {
+				deletedAt: LessThanOrEqual(DateUtils.mixedDateToUtcDatetimeString(date)),
+			},
+			take: this.hardDeletionBatchSize,
 
-				/**
-				 * @important This ensures soft-deleted executions are included,
-				 * else `@DeleteDateColumn()` at `deletedAt` will exclude them.
-				 */
-				withDeleted: true,
-			})
-		).map(({ id: executionId, workflowId }) => ({ workflowId, executionId }));
+			/**
+			 * @important This ensures soft-deleted executions are included,
+			 * else `@DeleteDateColumn()` at `deletedAt` will exclude them.
+			 */
+			withDeleted: true,
+		});
 
-		return workflowIdsAndExecutionIds;
+		return results.map(({ id: executionId, workflowId, storedAt }) => ({
+			workflowId,
+			executionId,
+			storedAt,
+		}));
 	}
 
 	async deleteByIds(executionIds: string[]) {
@@ -585,7 +613,7 @@ export class ExecutionRepository extends Repository<ExecutionEntity> {
 		const waitTill = new Date(Date.now() + 70000);
 		const where: FindOptionsWhere<ExecutionEntity> = {
 			waitTill: LessThanOrEqual(waitTill),
-			status: Not('crashed'),
+			status: 'waiting',
 		};
 
 		const dbType = this.globalConfig.database.type;
@@ -604,27 +632,22 @@ export class ExecutionRepository extends Repository<ExecutionEntity> {
 		});
 	}
 
-	async getExecutionsCountForPublicApi(data: {
+	async getExecutionsCountForPublicApi(params: {
 		limit: number;
 		lastId?: string;
 		workflowIds?: string[];
 		status?: ExecutionStatus;
-		excludedWorkflowIds?: string[];
+		excludedExecutionsIds?: string[];
 	}): Promise<number> {
-		const executions = await this.count({
-			where: {
-				...(data.lastId && { id: LessThan(data.lastId) }),
-				...(data.status && { ...this.getStatusCondition(data.status) }),
-				...(data.workflowIds && { workflowId: In(data.workflowIds) }),
-				...(data.excludedWorkflowIds && { workflowId: Not(In(data.excludedWorkflowIds)) }),
-			},
-			take: data.limit,
+		const executionsCount = await this.count({
+			where: this.getFindExecutionsForPublicApiCondition(params),
+			take: params.limit,
 		});
 
-		return executions;
+		return executionsCount;
 	}
 
-	private getStatusCondition(status: ExecutionStatus) {
+	private getStatusCondition(status?: ExecutionStatus) {
 		const condition: Pick<FindOptionsWhere<IExecutionFlattedDb>, 'status'> = {};
 
 		if (status === 'success') {
@@ -633,88 +656,45 @@ export class ExecutionRepository extends Repository<ExecutionEntity> {
 			condition.status = 'waiting';
 		} else if (status === 'error') {
 			condition.status = In(['error', 'crashed']);
+		} else if (status === 'canceled') {
+			condition.status = 'canceled';
+		} else if (status === 'running') {
+			condition.status = 'running';
 		}
 
 		return condition;
 	}
 
-	async getExecutionsForPublicApi(params: {
-		limit: number;
-		includeData?: boolean;
+	private getIdCondition(params: { lastId?: string; excludedExecutionsIds?: string[] }) {
+		const condition: Pick<FindOptionsWhere<IExecutionFlattedDb>, 'id'> = {};
+
+		if (params.lastId && params.excludedExecutionsIds?.length) {
+			condition.id = And(LessThan(params.lastId), Not(In(params.excludedExecutionsIds)));
+		} else if (params.lastId) {
+			condition.id = LessThan(params.lastId);
+		} else if (params.excludedExecutionsIds?.length) {
+			condition.id = Not(In(params.excludedExecutionsIds));
+		}
+
+		return condition;
+	}
+
+	getFindExecutionsForPublicApiCondition(params: {
 		lastId?: string;
 		workflowIds?: string[];
 		status?: ExecutionStatus;
 		excludedExecutionsIds?: string[];
-	}): Promise<IExecutionBase[]> {
-		let where: FindOptionsWhere<IExecutionFlattedDb> = {};
-
-		if (params.lastId && params.excludedExecutionsIds?.length) {
-			where.id = Raw((id) => `${id} < :lastId AND ${id} NOT IN (:...excludedExecutionsIds)`, {
+	}) {
+		const where: FindOptionsWhere<IExecutionFlattedDb> = {
+			...this.getIdCondition({
 				lastId: params.lastId,
 				excludedExecutionsIds: params.excludedExecutionsIds,
-			});
-		} else if (params.lastId) {
-			where.id = LessThan(params.lastId);
-		} else if (params.excludedExecutionsIds?.length) {
-			where.id = Not(In(params.excludedExecutionsIds));
-		}
+			}),
+			...this.getStatusCondition(params.status),
+			...(params.workflowIds && { workflowId: In(params.workflowIds) }),
+		};
 
-		if (params.status) {
-			where = { ...where, ...this.getStatusCondition(params.status) };
-		}
-
-		if (params.workflowIds) {
-			where = { ...where, workflowId: In(params.workflowIds) };
-		}
-
-		return await this.findMultipleExecutions(
-			{
-				select: [
-					'id',
-					'mode',
-					'retryOf',
-					'retrySuccessId',
-					'startedAt',
-					'stoppedAt',
-					'workflowId',
-					'waitTill',
-					'finished',
-				],
-				where,
-				order: { id: 'DESC' },
-				take: params.limit,
-				relations: ['executionData'],
-			},
-			{
-				includeData: params.includeData,
-				unflattenData: true,
-			},
-		);
-	}
-
-	async getExecutionInWorkflowsForPublicApi(
-		id: string,
-		workflowIds: string[],
-		includeData?: boolean,
-	): Promise<IExecutionBase | undefined> {
-		return await this.findSingleExecution(id, {
-			where: {
-				workflowId: In(workflowIds),
-			},
-			includeData,
-			unflattenData: true,
-		});
-	}
-
-	async findWithUnflattenedData(executionId: string, accessibleWorkflowIds: string[]) {
-		return await this.findSingleExecution(executionId, {
-			where: {
-				workflowId: In(accessibleWorkflowIds),
-			},
-			includeData: true,
-			unflattenData: true,
-			includeAnnotation: true,
-		});
+		return where;
 	}
 
 	async findIfShared(executionId: string, sharedWorkflowIds: string[]) {
@@ -737,36 +717,21 @@ export class ExecutionRepository extends Repository<ExecutionEntity> {
 	async stopBeforeRun(execution: IExecutionResponse) {
 		execution.status = 'canceled';
 		execution.stoppedAt = new Date();
+		execution.waitTill = null;
 
 		await this.update(
 			{ id: execution.id },
-			{ status: execution.status, stoppedAt: execution.stoppedAt },
+			{ status: execution.status, stoppedAt: execution.stoppedAt, waitTill: execution.waitTill },
 		);
 
 		return execution;
 	}
 
-	async stopDuringRun(execution: IExecutionResponse) {
-		const error = new ExecutionCancelledError(execution.id);
-
-		execution.data ??= { resultData: { runData: {} } };
-		execution.data.resultData.error = {
-			...error,
-			message: error.message,
-			stack: error.stack,
-		};
-
-		execution.stoppedAt = new Date();
-		execution.waitTill = null;
-		execution.status = 'canceled';
-
-		await this.updateExistingExecution(execution.id, execution);
-
-		return execution;
-	}
-
 	async cancelMany(executionIds: string[]) {
-		await this.update({ id: In(executionIds) }, { status: 'canceled', stoppedAt: new Date() });
+		await this.update(
+			{ id: In(executionIds) },
+			{ status: 'canceled', stoppedAt: new Date(), waitTill: null },
+		);
 	}
 
 	// ----------------------------------
@@ -779,6 +744,9 @@ export class ExecutionRepository extends Repository<ExecutionEntity> {
 	private summaryFields = {
 		id: true,
 		workflowId: true,
+		workflowVersionId: true,
+		jsonSizeBytes: true,
+		binaryDataSizeBytes: true,
 		mode: true,
 		retryOf: true,
 		status: true,
@@ -806,47 +774,38 @@ export class ExecutionRepository extends Repository<ExecutionEntity> {
 			}
 		>,
 	) {
-		return rawExecutionsWithTags.reduce(
-			(
-				acc,
-				{
-					annotation_id: _,
-					annotation_vote: vote,
-					annotation_tags_id: tagId,
-					annotation_tags_name: tagName,
-					...row
-				},
-			) => {
-				const existingExecution = acc.find((e) => e.id === row.id);
+		const summariesById = new Map<string, ExecutionSummary>();
 
-				if (existingExecution) {
-					if (tagId) {
-						existingExecution.annotation = existingExecution.annotation ?? {
-							vote,
-							tags: [] as Array<{ id: string; name: string }>,
-						};
-						existingExecution.annotation.tags.push({ id: tagId, name: tagName });
-					}
-				} else {
-					acc.push({
-						...row,
-						annotation: {
-							vote,
-							tags: tagId ? [{ id: tagId, name: tagName }] : [],
-						},
-					});
-				}
-				return acc;
-			},
-			[] as ExecutionSummary[],
-		);
+		for (const {
+			annotation_id: _,
+			annotation_vote: vote,
+			annotation_tags_id: tagId,
+			annotation_tags_name: tagName,
+			...row
+		} of rawExecutionsWithTags) {
+			let execution = summariesById.get(row.id);
+			if (!execution) {
+				execution = {
+					...row,
+					annotation: {
+						vote,
+						tags: tagId ? [{ id: tagId, name: tagName }] : [],
+					},
+				};
+				summariesById.set(row.id, execution);
+			} else if (tagId) {
+				execution.annotation = execution.annotation ?? {
+					vote,
+					tags: [] as Array<{ id: string; name: string }>,
+				};
+				execution.annotation.tags.push({ id: tagId, name: tagName });
+			}
+		}
+
+		return [...summariesById.values()];
 	}
 
 	async findManyByRangeQuery(query: ExecutionSummaries.RangeQuery): Promise<ExecutionSummary[]> {
-		if (query?.accessibleWorkflowIds?.length === 0) {
-			throw new UnexpectedError('Expected accessible workflow IDs');
-		}
-
 		// Due to performance reasons, we use custom query builder with raw SQL.
 		// IMPORTANT: it produces duplicate rows for executions with multiple tags, which we need to reduce manually
 		const qb = this.toQueryBuilderWithAnnotations(query);
@@ -872,8 +831,20 @@ export class ExecutionRepository extends Repository<ExecutionEntity> {
 		startedAt: Date | string | null;
 		stoppedAt?: Date | string;
 		waitTill?: Date | string | null;
+		jsonSizeBytes?: number | string;
+		binaryDataSizeBytes?: number | string;
 	}): ExecutionSummary {
 		execution.id = execution.id.toString();
+
+		if (execution.jsonSizeBytes !== undefined && typeof execution.jsonSizeBytes === 'string') {
+			// Raw query bypasses the entity transformer, so Postgres hands bigint back as a string.
+			execution.jsonSizeBytes = Number(execution.jsonSizeBytes);
+		}
+
+		if (typeof execution.binaryDataSizeBytes === 'string') {
+			// Raw query bypasses the entity transformer, so Postgres hands bigint back as a string.
+			execution.binaryDataSizeBytes = Number(execution.binaryDataSizeBytes);
+		}
 
 		const normalizeDateString = (date: string) => {
 			if (date.includes(' ')) return date.replace(' ', 'T') + 'Z';
@@ -918,7 +889,7 @@ export class ExecutionRepository extends Repository<ExecutionEntity> {
 	async getLiveExecutionRowsOnPostgres() {
 		const tableName = `${this.globalConfig.database.tablePrefix}execution_entity`;
 
-		const pgSql = `SELECT n_live_tup as result FROM pg_stat_all_tables WHERE relname = '${tableName}';`;
+		const pgSql = `SELECT n_live_tup as result FROM pg_stat_all_tables WHERE relname = '${tableName}' and schemaname = '${this.globalConfig.database.postgresdb.schema}';`;
 
 		try {
 			const rows = (await this.query(pgSql)) as Array<{ result: string }>;
@@ -937,7 +908,8 @@ export class ExecutionRepository extends Repository<ExecutionEntity> {
 
 	private toQueryBuilder(query: ExecutionSummaries.Query) {
 		const {
-			accessibleWorkflowIds,
+			user,
+			sharingOptions,
 			status,
 			finished,
 			workflowId,
@@ -947,6 +919,9 @@ export class ExecutionRepository extends Repository<ExecutionEntity> {
 			annotationTags,
 			vote,
 			projectId,
+			workflowVersionId,
+			isArchived,
+			workflowBooleanSettings,
 		} = query;
 
 		const fields = Object.keys(this.summaryFields)
@@ -956,8 +931,23 @@ export class ExecutionRepository extends Repository<ExecutionEntity> {
 
 		const qb = this.createQueryBuilder('execution')
 			.select(fields)
-			.innerJoin('execution.workflow', 'workflow')
-			.where('execution.workflowId IN (:...accessibleWorkflowIds)', { accessibleWorkflowIds });
+			.innerJoin('execution.workflow', 'workflow');
+
+		if (user && sharingOptions) {
+			// EXISTS-based access control — correlated subquery for better query plans
+			const subquery = this.sharedWorkflowRepository.buildSharedWorkflowIdsSubquery(
+				user,
+				sharingOptions,
+			);
+			subquery.andWhere('"sw"."workflowId" = execution."workflowId"');
+			qb.where(`EXISTS (${subquery.getQuery()})`);
+			qb.setParameters(subquery.getParameters());
+		} else if (user && hasGlobalScope(user, 'workflow:read')) {
+			// Global-scope admin without sharingOptions — no access-control filter needed
+		} else {
+			// No user or insufficient scope — deny all to prevent unscoped queries
+			qb.where('1 = 0');
+		}
 
 		if (query.kind === 'range') {
 			const { limit, firstId, lastId } = query.range;
@@ -983,19 +973,29 @@ export class ExecutionRepository extends Repository<ExecutionEntity> {
 		if (startedAfter) qb.andWhere({ startedAt: moreThanOrEqual(startedAfter) });
 
 		if (metadata?.length === 1) {
-			const [{ key, value }] = metadata;
+			const [{ key, value, exactMatch }] = metadata;
 
-			qb.innerJoin(
-				ExecutionMetadata,
-				'md',
-				'md.executionId = execution.id AND md.key = :key AND md.value = :value',
-			);
+			const executionIdMatch = 'md.executionId = execution.id';
+			const keyMatch = exactMatch ? 'md.key = :key' : 'LOWER(md.key) = LOWER(:key)';
+			const valueMatch = exactMatch ? 'md.value = :value' : 'LOWER(md.value) LIKE LOWER(:value)';
+
+			const matches = [executionIdMatch, keyMatch, valueMatch];
+
+			qb.innerJoin(ExecutionMetadata, 'md', matches.join(' AND '));
 
 			qb.setParameter('key', key);
-			qb.setParameter('value', value);
+			qb.setParameter('value', exactMatch ? value : `%${value}%`);
 		}
 
-		// eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
+		if (workflowVersionId) {
+			qb.innerJoin(
+				'execution.executionData',
+				'executionData',
+				'executionData.workflowVersionId = :workflowVersionId',
+			);
+			qb.setParameter('workflowVersionId', workflowVersionId);
+		}
+
 		if (annotationTags?.length || vote) {
 			// If there is a filter by one or multiple tags or by vote - we need to join the annotations table
 			qb.innerJoin('execution.annotation', 'annotation');
@@ -1023,6 +1023,16 @@ export class ExecutionRepository extends Repository<ExecutionEntity> {
 			qb.innerJoin(WorkflowEntity, 'w', 'w.id = execution.workflowId')
 				.innerJoin(SharedWorkflow, 'sw', 'sw.workflowId = w.id')
 				.andWhere('sw.projectId = :projectId', { projectId });
+		}
+
+		if (isArchived !== undefined) {
+			qb.andWhere('workflow.isArchived = :isArchived', { isArchived });
+		}
+
+		if (workflowBooleanSettings?.length) {
+			for (const { key, value } of workflowBooleanSettings) {
+				applyWorkflowBooleanSettingFilter(qb, this.globalConfig, key, value);
+			}
 		}
 
 		return qb;
@@ -1059,8 +1069,8 @@ export class ExecutionRepository extends Repository<ExecutionEntity> {
 
 		// Sort the final result after the joins again, because there is no
 		// guarantee that the order is unchanged after performing joins. Especially
-		// postgres and MySQL returned to the natural order again, listing
-		// executions in the order they were created.
+		// postgres returned to the natural order again, listing executions in the
+		// order they were created.
 		if (query.kind === 'range') {
 			if (query.order?.startedAt === 'DESC') {
 				const table = qb.escape('e');
@@ -1075,6 +1085,17 @@ export class ExecutionRepository extends Repository<ExecutionEntity> {
 		}
 
 		return qb;
+	}
+
+	async getDistinctVersionIds(workflowId: string): Promise<string[]> {
+		const result = await this.createQueryBuilder('execution')
+			.innerJoin('execution.executionData', 'ed')
+			.select('DISTINCT ed.workflowVersionId', 'workflowVersionId')
+			.where('execution.workflowId = :workflowId', { workflowId })
+			.andWhere('ed.workflowVersionId IS NOT NULL')
+			.getRawMany<{ workflowVersionId: string }>();
+
+		return result.map((r) => r.workflowVersionId);
 	}
 
 	async getAllIds() {
@@ -1095,5 +1116,66 @@ export class ExecutionRepository extends Repository<ExecutionEntity> {
 		});
 
 		return executions.map(({ id }) => id);
+	}
+
+	/**
+	 * The number of executions that are running and count towards the concurrent executions limit.
+	 * Concurrency control only applies to executions started from a webhook or trigger node.
+	 */
+	async getConcurrentExecutionsCount() {
+		const concurrentExecutionsCount = await this.count({
+			where: { status: 'running', mode: In(['webhook', 'trigger']) },
+		});
+
+		return concurrentExecutionsCount;
+	}
+
+	private async handleExecutionRunData(
+		data: string,
+		options: { unflattenData?: boolean } = {},
+	): Promise<IRunExecutionData | string | undefined> {
+		if (options.unflattenData) {
+			// Parse the serialized data (async for large payloads to avoid blocking the event loop).
+			const deserializedData: unknown = await parseFlatted(data);
+			// If it parses to an object, migrate and return it.
+			if (deserializedData) {
+				return migrateRunExecutionData(deserializedData as IRunExecutionDataAll);
+			}
+			return undefined;
+		}
+		// Just return the string data as-is.
+		return data;
+	}
+
+	async findByStopExecutionsFilter(
+		query: ExecutionSummaries.StopExecutionFilterQuery,
+	): Promise<Array<{ id: string }>> {
+		if (!query.status || query.status.length === 0) return [];
+
+		const where: FindOptionsWhere<ExecutionEntity> = {
+			status: In(query.status),
+		};
+
+		if (query.workflowId !== 'all') {
+			where.workflowId = query.workflowId;
+		}
+
+		const startedAtConditions = [];
+
+		if (query.startedAfter)
+			startedAtConditions.push(
+				MoreThanOrEqual(DateUtils.mixedDateToUtcDatetimeString(new Date(query.startedAfter))),
+			);
+
+		if (query.startedBefore)
+			startedAtConditions.push(
+				LessThanOrEqual(DateUtils.mixedDateToUtcDatetimeString(new Date(query.startedBefore))),
+			);
+
+		if (startedAtConditions.length > 0) {
+			where.startedAt = And(...startedAtConditions);
+		}
+
+		return await this.find({ select: ['id'], where });
 	}
 }

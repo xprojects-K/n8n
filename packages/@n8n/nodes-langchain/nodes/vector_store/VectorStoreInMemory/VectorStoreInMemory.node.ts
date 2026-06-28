@@ -1,5 +1,5 @@
 import type { Embeddings } from '@langchain/core/embeddings';
-import type { MemoryVectorStore } from 'langchain/vectorstores/memory';
+import type { MemoryVectorStore } from '@langchain/classic/vectorstores/memory';
 import {
 	type INodeProperties,
 	type ILoadOptionsFunctions,
@@ -8,11 +8,10 @@ import {
 	type NodeParameterValueType,
 	type IExecuteFunctions,
 	type ISupplyDataFunctions,
-	ApplicationError,
+	UserError,
 } from 'n8n-workflow';
 
-import { createVectorStoreNode } from '../shared/createVectorStoreNode/createVectorStoreNode';
-import { MemoryVectorStoreManager } from '../shared/MemoryManager/MemoryVectorStoreManager';
+import { createVectorStoreNode, MemoryVectorStoreManager } from '@n8n/ai-utilities';
 
 const warningBanner: INodeProperties = {
 	displayName:
@@ -56,12 +55,26 @@ export class VectorStoreInMemory extends createVectorStoreNode<MemoryVectorStore
 	meta: {
 		displayName: 'Simple Vector Store',
 		name: 'vectorStoreInMemory',
-		description:
-			"Work with your data in a Simple Vector Store. Don't use this for production usage.",
-		icon: 'fa:database',
+		description: 'The easiest way to experiment with vector stores, without external setup.',
+		icon: 'node:simple-vector-store',
 		iconColor: 'black',
 		docsUrl:
 			'https://docs.n8n.io/integrations/builtin/cluster-nodes/root-nodes/n8n-nodes-langchain.vectorstoreinmemory/',
+		categories: ['AI'],
+		subcategories: {
+			AI: ['Vector Stores', 'Tools', 'Root Nodes'],
+			'Vector Stores': ['For Beginners'],
+			Tools: ['Other Tools'],
+		},
+		builderHint: {
+			relatedNodes: [
+				{
+					nodeType: '@n8n/n8n-nodes-langchain.retrieverVectorStore',
+					relationHint:
+						'Connect to enable retrieval-augmented generation (RAG) for AI Agent workflows',
+				},
+			],
+		},
 	},
 	sharedFields: [
 		{
@@ -150,7 +163,7 @@ export class VectorStoreInMemory extends createVectorStoreNode<MemoryVectorStore
 				payload: string | IDataObject | undefined,
 			): Promise<NodeParameterValueType> {
 				if (!payload || typeof payload === 'string') {
-					throw new ApplicationError('Invalid payload type');
+					throw new UserError('Invalid payload type');
 				}
 
 				const { name } = payload;
@@ -160,7 +173,7 @@ export class VectorStoreInMemory extends createVectorStoreNode<MemoryVectorStore
 					this.logger,
 				);
 
-				const memoryKey = !!name ? (name as string) : DEFAULT_MEMORY_KEY;
+				const memoryKey = name ? (name as string) : DEFAULT_MEMORY_KEY;
 				await vectorStoreSingleton.getVectorStore(memoryKey);
 
 				return memoryKey;

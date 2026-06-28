@@ -1,10 +1,11 @@
 delete:
   x-eov-operation-id: deleteUserFromProject
+  x-required-scope: project:update
   x-eov-operation-handler: v1/handlers/projects/projects.handler
   tags:
     - Projects
   summary: Delete a user from a project
-  description: Delete a user from a project from your instance.
+  description: Delete a user from a project on your instance.
   parameters:
     - name: projectId
       in: path
@@ -29,6 +30,7 @@ delete:
       $ref: '../../../../shared/spec/responses/notFound.yml'
 patch:
   x-eov-operation-id: changeUserRoleInProject
+  x-required-scope: project:update
   x-eov-operation-handler: v1/handlers/projects/projects.handler
   tags:
     - Projects
@@ -48,7 +50,7 @@ patch:
       schema:
         type: string
   requestBody:
-    description: Updated project object.
+    description: Payload containing the new role to assign to the project user.
     content:
       application/json:
         schema:

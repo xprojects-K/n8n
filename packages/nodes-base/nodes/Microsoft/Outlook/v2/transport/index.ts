@@ -11,6 +11,22 @@ import type {
 
 import { prepareApiError } from '../helpers/utils';
 
+export type OutlookCredentialType = 'microsoftOutlookOAuth2Api' | 'microsoftOAuth2Api';
+
+/**
+ * Resolves which credential type the node is configured to use. Defaults to the
+ * node-specific `microsoftOutlookOAuth2Api` so existing workflows (and nodes
+ * without the `authentication` selector) keep working unchanged, while allowing
+ * the generic `microsoftOAuth2Api` (Graph) credential to be selected.
+ */
+export function getOutlookCredentialType(
+	this: IExecuteFunctions | IExecuteSingleFunctions | ILoadOptionsFunctions | IPollFunctions,
+): OutlookCredentialType {
+	return this.getNodeParameter('authentication', 0) === 'microsoftOAuth2Api'
+		? 'microsoftOAuth2Api'
+		: 'microsoftOutlookOAuth2Api';
+}
+
 export async function microsoftApiRequest(
 	this: IExecuteFunctions | IExecuteSingleFunctions | ILoadOptionsFunctions | IPollFunctions,
 	method: IHttpRequestMethods,
@@ -21,12 +37,19 @@ export async function microsoftApiRequest(
 	headers: IDataObject = {},
 	option: IDataObject = { json: true },
 ) {
-	const credentials = await this.getCredentials('microsoftOutlookOAuth2Api');
+	const credentialType = getOutlookCredentialType.call(this);
+	const credentials = await this.getCredentials(credentialType);
 
-	let apiUrl = `https://graph.microsoft.com/v1.0/me${resource}`;
+	const baseUrl = (
+		typeof credentials.graphApiBaseUrl === 'string' && credentials.graphApiBaseUrl !== ''
+			? credentials.graphApiBaseUrl
+			: 'https://graph.microsoft.com'
+	).replace(/\/+$/, '');
+
+	let apiUrl = `${baseUrl}/v1.0/me${resource}`;
 	// If accessing shared mailbox
 	if (credentials.useShared && credentials.userPrincipalName) {
-		apiUrl = `https://graph.microsoft.com/v1.0/users/${credentials.userPrincipalName}${resource}`;
+		apiUrl = `${baseUrl}/v1.0/users/${credentials.userPrincipalName}${resource}`;
 	}
 
 	const options: IRequestOptions = {
@@ -49,11 +72,7 @@ export async function microsoftApiRequest(
 			delete options.body;
 		}
 
-		return await this.helpers.requestWithAuthentication.call(
-			this,
-			'microsoftOutlookOAuth2Api',
-			options,
-		);
+		return await this.helpers.requestWithAuthentication.call(this, credentialType, options);
 	} catch (error) {
 		if (
 			((error.message || '').toLowerCase().includes('bad request') ||
@@ -200,21 +219,20 @@ export async function getSubfolders(
 	const returnData: IDataObject[] = [...folders];
 	for (const folder of folders) {
 		if ((folder.childFolderCount as number) > 0) {
-			let subfolders = await microsoftApiRequest.call(
+			let subfolders = await microsoftApiRequestAllItems.call(
 				this,
+				'value',
 				'GET',
 				`/mailFolders/${folder.id}/childFolders`,
 			);
 
 			if (addPathToDisplayName) {
-				subfolders = subfolders.value.map((subfolder: IDataObject) => {
+				subfolders = subfolders.map((subfolder: IDataObject) => {
 					return {
 						...subfolder,
 						displayName: `${folder.displayName}/${subfolder.displayName}`,
 					};
 				});
-			} else {
-				subfolders = subfolders.value;
 			}
 
 			returnData.push(

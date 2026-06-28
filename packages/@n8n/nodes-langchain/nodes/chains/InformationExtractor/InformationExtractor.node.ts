@@ -1,6 +1,6 @@
 import type { BaseLanguageModel } from '@langchain/core/language_models/base';
 import type { JSONSchema7 } from 'json-schema';
-import { OutputFixingParser, StructuredOutputParser } from 'langchain/output_parsers';
+import { OutputFixingParser, StructuredOutputParser } from '@langchain/classic/output_parsers';
 import { jsonParse, NodeConnectionTypes, NodeOperationError, sleep } from 'n8n-workflow';
 import type {
 	INodeType,
@@ -11,9 +11,15 @@ import type {
 } from 'n8n-workflow';
 import type { z } from 'zod';
 
-import { inputSchemaField, jsonSchemaExampleField, schemaTypeField } from '@utils/descriptions';
-import { convertJsonSchemaToZod, generateSchema } from '@utils/schemaParsing';
-import { getBatchingOptionFields } from '@utils/sharedFields';
+import {
+	buildJsonSchemaExampleNotice,
+	inputSchemaField,
+	jsonSchemaExampleField,
+	schemaTypeField,
+} from '@utils/descriptions';
+import { convertJsonSchemaToZod, generateSchemaFromExample } from '@utils/schemaParsing';
+import { getBatchingOptionFields } from '@n8n/ai-utilities';
+import { wrapLangChainParserError } from '@utils/output_parsers/langchainParserError';
 
 import { SYSTEM_PROMPT_TEMPLATE } from './constants';
 import { makeZodSchemaFromAttributes } from './helpers';
@@ -24,10 +30,11 @@ export class InformationExtractor implements INodeType {
 	description: INodeTypeDescription = {
 		displayName: 'Information Extractor',
 		name: 'informationExtractor',
-		icon: 'fa:project-diagram',
+		icon: 'node:information-extractor',
 		iconColor: 'black',
 		group: ['transform'],
-		version: [1, 1.1],
+		version: [1, 1.1, 1.2],
+		defaultVersion: 1.2,
 		description: 'Extract information from text in a structured format',
 		codex: {
 			alias: ['NER', 'parse', 'parsing', 'JSON', 'data extraction', 'structured'],
@@ -56,6 +63,11 @@ export class InformationExtractor implements INodeType {
 			},
 		],
 		outputs: [NodeConnectionTypes.Main],
+		builderHint: {
+			inputs: {
+				ai_languageModel: { required: true },
+			},
+		},
 		properties: [
 			{
 				displayName: 'Text',
@@ -88,6 +100,11 @@ export class InformationExtractor implements INodeType {
 	"cities": ["Los Angeles", "San Francisco", "San Diego"]
 }`,
 			},
+			buildJsonSchemaExampleNotice({
+				showExtraProps: {
+					'@version': [{ _cnd: { gte: 1.2 } }],
+				},
+			}),
 			{
 				...inputSchemaField,
 				default: `{
@@ -104,18 +121,6 @@ export class InformationExtractor implements INodeType {
 		}
 	}
 }`,
-			},
-			{
-				displayName:
-					'The schema has to be defined in the <a target="_blank" href="https://json-schema.org/">JSON Schema</a> format. Look at <a target="_blank" href="https://json-schema.org/learn/miscellaneous-examples.html">this</a> page for examples.',
-				name: 'notice',
-				type: 'notice',
-				default: '',
-				displayOptions: {
-					show: {
-						schemaType: ['manual'],
-					},
-				},
 			},
 			{
 				displayName: 'Attributes',
@@ -254,7 +259,10 @@ export class InformationExtractor implements INodeType {
 
 			if (schemaType === 'fromJson') {
 				const jsonExample = this.getNodeParameter('jsonSchemaExample', 0, '') as string;
-				jsonSchema = generateSchema(jsonExample);
+				// Enforce all fields to be required in the generated schema if the node version is 1.2 or higher
+				const jsonExampleAllFieldsRequired = this.getNode().typeVersion >= 1.2;
+
+				jsonSchema = generateSchemaFromExample(jsonExample, jsonExampleAllFieldsRequired);
 			} else {
 				const inputSchema = this.getNodeParameter('inputSchema', 0, '') as string;
 				jsonSchema = jsonParse<JSONSchema7>(inputSchema);
@@ -285,7 +293,7 @@ export class InformationExtractor implements INodeType {
 
 				batchResults.forEach((response, index) => {
 					if (response.status === 'rejected') {
-						const error = response.reason as Error;
+						const error = wrapLangChainParserError(response.reason, this.getNode(), i + index);
 						if (this.continueOnFail()) {
 							resultData.push({
 								json: { error: error.message },
@@ -293,7 +301,7 @@ export class InformationExtractor implements INodeType {
 							});
 							return;
 						} else {
-							throw new NodeOperationError(this.getNode(), error.message);
+							throw new NodeOperationError(this.getNode(), error);
 						}
 					}
 					const output = response.value;
@@ -312,12 +320,16 @@ export class InformationExtractor implements INodeType {
 					const output = await processItem(this, itemIndex, llm, parser);
 					resultData.push({ json: { output } });
 				} catch (error) {
+					const executionError = wrapLangChainParserError(error, this.getNode(), itemIndex);
 					if (this.continueOnFail()) {
-						resultData.push({ json: { error: error.message }, pairedItem: { item: itemIndex } });
+						resultData.push({
+							json: { error: executionError.message },
+							pairedItem: { item: itemIndex },
+						});
 						continue;
 					}
 
-					throw error;
+					throw executionError;
 				}
 			}
 		}

@@ -1,5 +1,6 @@
+import { generateNanoId } from '@n8n/utils';
+
 import type { ApiKey } from '../../entities';
-import { generateNanoId } from '../../utils/generators';
 import type { MigrationContext, ReversibleMigration } from '../migration-types';
 
 export class AddApiKeysTable1724951148974 implements ReversibleMigration {
@@ -39,7 +40,6 @@ export class AddApiKeysTable1724951148974 implements ReversibleMigration {
 		// Move the apiKey from the users table to the new table
 		await Promise.all(
 			usersWithApiKeys.map(
-				// @ts-expect-error Tech debt
 				async (user: { id: string; apiKey: string }) =>
 					await runQuery(
 						`INSERT INTO ${userApiKeysTable} (${idColumn}, ${userIdColumn}, ${apiKeyColumn}, ${labelColumn}) VALUES (:id, :userId, :apiKey, :label)`,
@@ -62,7 +62,6 @@ export class AddApiKeysTable1724951148974 implements ReversibleMigration {
 		runQuery,
 		schemaBuilder: { dropTable, addColumns, createIndex, column },
 		escape,
-		isMysql,
 	}: MigrationContext) {
 		const userTable = escape.tableName('user');
 		const userApiKeysTable = escape.tableName('user_api_keys');
@@ -71,20 +70,11 @@ export class AddApiKeysTable1724951148974 implements ReversibleMigration {
 		const idColumn = escape.columnName('id');
 		const createdAtColumn = escape.columnName('createdAt');
 
-		await addColumns('user', [column('apiKey').varchar()]);
+		await addColumns('user', [column('apiKey').varchar()], { recreatesOnSqlite: true });
 
 		await createIndex('user', ['apiKey'], true);
 
-		const queryToGetUsersApiKeys = isMysql
-			? `
-			SELECT ${userIdColumn},
-				${apiKeyColumn},
-				${createdAtColumn}
-			FROM ${userApiKeysTable} u
-			WHERE ${createdAtColumn} = (SELECT Min(${createdAtColumn})
-																	FROM   ${userApiKeysTable}
-																	WHERE  ${userIdColumn} = u.${userIdColumn});`
-			: `
+		const queryToGetUsersApiKeys = `
 				SELECT DISTINCT ON
 					(${userIdColumn}) ${userIdColumn},
 					${apiKeyColumn}, ${createdAtColumn}
@@ -97,7 +87,6 @@ export class AddApiKeysTable1724951148974 implements ReversibleMigration {
 
 		await Promise.all(
 			oldestApiKeysPerUser.map(
-				// @ts-expect-error Tech debt
 				async (user: { userId: string; apiKey: string }) =>
 					await runQuery(
 						`UPDATE ${userTable} SET ${apiKeyColumn} = :apiKey WHERE ${idColumn} = :userId`,

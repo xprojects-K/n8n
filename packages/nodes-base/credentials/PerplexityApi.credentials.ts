@@ -10,7 +10,7 @@ export class PerplexityApi implements ICredentialType {
 
 	displayName = 'Perplexity API';
 
-	documentationUrl = 'https://docs.perplexity.ai';
+	documentationUrl = 'perplexity';
 
 	properties: INodeProperties[] = [
 		{
@@ -29,6 +29,7 @@ export class PerplexityApi implements ICredentialType {
 		properties: {
 			headers: {
 				Authorization: '=Bearer {{$credentials.apiKey}}',
+				'X-Source': 'n8n',
 			},
 		},
 	};
@@ -39,7 +40,7 @@ export class PerplexityApi implements ICredentialType {
 			url: '/chat/completions',
 			method: 'POST',
 			body: {
-				model: 'r1-1776',
+				model: 'sonar',
 				messages: [{ role: 'user', content: 'test' }],
 			},
 			headers: {

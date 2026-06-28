@@ -1,5 +1,5 @@
 import { connect, type IClientOptions, type MqttClient } from 'mqtt';
-import { ApplicationError, randomString } from 'n8n-workflow';
+import { OperationalError, randomString } from 'n8n-workflow';
 
 import { formatPrivateKey } from '@utils/utilities';
 
@@ -55,7 +55,7 @@ export const createClient = async (credentials: MqttCredential): Promise<MqttCli
 
 		const onConnect = () => {
 			client.removeListener('connect', onConnect);
-			// eslint-disable-next-line @typescript-eslint/no-use-before-define
+
 			client.removeListener('error', onError);
 			resolve(client);
 		};
@@ -67,7 +67,7 @@ export const createClient = async (credentials: MqttCredential): Promise<MqttCli
 			// keep trying to reconnect until it succeeds unless we
 			// explicitly close the client
 			client.end();
-			reject(new ApplicationError(error.message));
+			reject(new OperationalError(error.message));
 		};
 
 		client.once('connect', onConnect);

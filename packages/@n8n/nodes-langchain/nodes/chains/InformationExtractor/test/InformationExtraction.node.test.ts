@@ -1,7 +1,8 @@
 import type { BaseLanguageModel } from '@langchain/core/language_models/base';
 import { FakeListChatModel } from '@langchain/core/utils/testing';
 import get from 'lodash/get';
-import type { IDataObject, IExecuteFunctions } from 'n8n-workflow';
+import type { IDataObject, IExecuteFunctions, INode } from 'n8n-workflow';
+import { mock } from 'vitest-mock-extended';
 
 import { makeZodSchemaFromAttributes } from '../helpers';
 import { InformationExtractor } from '../InformationExtractor.node';
@@ -85,6 +86,208 @@ describe('InformationExtractor', () => {
 			expect(schema.parse({ name: 'John', age: 30 })).toEqual({ name: 'John', age: 30 });
 			expect(schema.parse({ name: 'John' })).toEqual({ name: 'John' });
 			expect(schema.parse({ age: 30 })).toEqual({ age: 30 });
+		});
+	});
+
+	describe('Single Item Processing with JSON Schema from Example', () => {
+		it('should extract information using JSON schema from example - version 1.2 (required fields)', async () => {
+			const node = new InformationExtractor();
+			const inputData = [
+				{
+					json: { text: 'John lives in California and has visited Los Angeles and San Francisco' },
+				},
+			];
+
+			const mockExecuteFunctions = createExecuteFunctionsMock(
+				{
+					text: 'John lives in California and has visited Los Angeles and San Francisco',
+					schemaType: 'fromJson',
+					jsonSchemaExample: JSON.stringify({
+						state: 'California',
+						cities: ['Los Angeles', 'San Francisco'],
+					}),
+					options: {
+						systemPromptTemplate: '',
+					},
+				},
+				new FakeListChatModel({
+					responses: [
+						formatFakeLlmResponse({
+							state: 'California',
+							cities: ['Los Angeles', 'San Francisco'],
+						}),
+					],
+				}),
+				inputData,
+			);
+
+			// Mock version 1.2 to test required fields behavior
+			mockExecuteFunctions.getNode = () => mock<INode>({ typeVersion: 1.2 });
+
+			const response = await node.execute.call(mockExecuteFunctions);
+
+			expect(response).toEqual([
+				[
+					{
+						json: {
+							output: {
+								state: 'California',
+								cities: ['Los Angeles', 'San Francisco'],
+							},
+						},
+					},
+				],
+			]);
+		});
+
+		it('should extract information using JSON schema from example - version 1.1 (optional fields)', async () => {
+			const node = new InformationExtractor();
+			const inputData = [{ json: { text: 'John lives in California' } }];
+
+			const mockExecuteFunctions = createExecuteFunctionsMock(
+				{
+					text: 'John lives in California',
+					schemaType: 'fromJson',
+					jsonSchemaExample: JSON.stringify({
+						state: 'California',
+						cities: ['Los Angeles', 'San Francisco'],
+					}),
+					options: {
+						systemPromptTemplate: '',
+					},
+				},
+				new FakeListChatModel({
+					responses: [
+						formatFakeLlmResponse({
+							state: 'California',
+							// cities field missing - should be allowed in v1.1
+						}),
+					],
+				}),
+				inputData,
+			);
+
+			// Mock version 1.1 to test optional fields behavior
+			mockExecuteFunctions.getNode = () => mock<INode>({ typeVersion: 1.1 });
+
+			const response = await node.execute.call(mockExecuteFunctions);
+
+			expect(response).toEqual([
+				[
+					{
+						json: {
+							output: {
+								state: 'California',
+							},
+						},
+					},
+				],
+			]);
+		});
+
+		it('should throw error for incomplete model output in version 1.2 (required fields)', async () => {
+			const node = new InformationExtractor();
+			const inputData = [{ json: { text: 'John lives in California' } }];
+
+			const mockExecuteFunctions = createExecuteFunctionsMock(
+				{
+					text: 'John lives in California',
+					schemaType: 'fromJson',
+					jsonSchemaExample: JSON.stringify({
+						state: 'California',
+						cities: ['Los Angeles', 'San Francisco'],
+						zipCode: '90210',
+					}),
+					options: {
+						systemPromptTemplate: '',
+					},
+				},
+				new FakeListChatModel({
+					responses: [
+						formatFakeLlmResponse({
+							state: 'California',
+							// Missing cities and zipCode - should fail in v1.2 since all fields are required
+						}),
+					],
+				}),
+				inputData,
+			);
+
+			mockExecuteFunctions.getNode = () => mock<INode>({ typeVersion: 1.2 });
+
+			await expect(node.execute.call(mockExecuteFunctions)).rejects.toThrow();
+		});
+
+		it('should extract information using complex nested JSON schema from example', async () => {
+			const node = new InformationExtractor();
+			const inputData = [
+				{
+					json: {
+						text: 'John Doe works at Acme Corp as a Software Engineer with 5 years experience',
+					},
+				},
+			];
+
+			const complexSchema = {
+				person: {
+					name: 'John Doe',
+					company: {
+						name: 'Acme Corp',
+						position: 'Software Engineer',
+					},
+				},
+				experience: {
+					years: 5,
+					skills: ['JavaScript', 'TypeScript'],
+				},
+			};
+
+			const mockExecuteFunctions = createExecuteFunctionsMock(
+				{
+					text: 'John Doe works at Acme Corp as a Software Engineer with 5 years experience',
+					schemaType: 'fromJson',
+					jsonSchemaExample: JSON.stringify(complexSchema),
+					options: {
+						systemPromptTemplate: '',
+					},
+				},
+				new FakeListChatModel({
+					responses: [
+						formatFakeLlmResponse({
+							person: {
+								name: 'John Doe',
+								company: {
+									name: 'Acme Corp',
+									position: 'Software Engineer',
+								},
+							},
+							experience: {
+								years: 5,
+								skills: ['JavaScript', 'TypeScript'],
+							},
+						}),
+					],
+				}),
+				inputData,
+			);
+
+			mockExecuteFunctions.getNode = () => mock<INode>({ typeVersion: 1.2 });
+
+			const response = await node.execute.call(mockExecuteFunctions);
+
+			expect(response[0][0].json.output).toMatchObject({
+				person: {
+					name: 'John Doe',
+					company: {
+						name: 'Acme Corp',
+						position: 'Software Engineer',
+					},
+				},
+				experience: {
+					years: 5,
+					skills: expect.arrayContaining(['JavaScript', 'TypeScript']),
+				},
+			});
 		});
 	});
 
@@ -172,7 +375,7 @@ describe('InformationExtractor', () => {
 			expect(response[0]).toHaveLength(3);
 			expect(response[0][0]).toEqual({ json: { output: { name: 'John', age: 30 } } });
 			expect(response[0][1]).toEqual({
-				json: { error: expect.stringContaining('Failed to parse') },
+				json: { error: "Model output doesn't fit required format" },
 				pairedItem: { item: 1 },
 			});
 			expect(response[0][2]).toEqual({ json: { output: { name: 'Bob', age: 40 } } });
@@ -211,7 +414,9 @@ describe('InformationExtractor', () => {
 				inputData,
 			);
 
-			await expect(node.execute.call(mockExecuteFunctions)).rejects.toThrow('Failed to parse');
+			await expect(node.execute.call(mockExecuteFunctions)).rejects.toThrow(
+				"Model output doesn't fit required format",
+			);
 		});
 	});
 });

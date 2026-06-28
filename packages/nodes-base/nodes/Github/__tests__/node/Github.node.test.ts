@@ -2,7 +2,9 @@ import { NodeTestHarness } from '@nodes-testing/node-test-harness';
 import { NodeApiError, NodeOperationError } from 'n8n-workflow';
 import nock from 'nock';
 
+import * as utilities from '../../../../utils/utilities';
 import { Github } from '../../Github.node';
+import type * as _importType0 from '../../../../utils/utilities';
 
 describe('Test Github Node', () => {
 	describe('Workflow Dispatch', () => {
@@ -59,7 +61,73 @@ describe('Test Github Node', () => {
 		};
 
 		beforeAll(async () => {
-			jest.useFakeTimers({ doNotFake: ['nextTick'], now });
+			vi.useFakeTimers({ now });
+		});
+
+		describe('removeTrailingSlash Function', () => {
+			let githubNode: Github;
+			let mockExecutionContext: any;
+
+			beforeEach(() => {
+				githubNode = new Github();
+				mockExecutionContext = {
+					getNode: vi.fn().mockReturnValue({ name: 'Github' }),
+					getNodeParameter: vi.fn(),
+					getInputData: vi.fn().mockReturnValue([{ json: {} }]),
+					continueOnFail: vi.fn().mockReturnValue(false),
+					getCredentials: vi.fn().mockResolvedValue({
+						server: 'https://api.github.com',
+						user: 'test',
+						accessToken: 'test',
+					}),
+					helpers: {
+						returnJsonArray: vi.fn().mockReturnValue([{ json: {} }]),
+						requestWithAuthentication: vi.fn().mockResolvedValue({}),
+						constructExecutionMetaData: vi.fn().mockReturnValue([{ json: {} }]),
+					},
+				};
+
+				vi.spyOn(utilities, 'removeTrailingSlash');
+				vi.mock('../../../../utils/utilities', async () => ({
+					...(await vi.importActual<typeof _importType0>('../../../../utils/utilities')),
+					getFileSha: vi.fn().mockResolvedValue('mockedSHA'),
+				}));
+			});
+
+			it('should call remove trailing slash', async () => {
+				mockExecutionContext.getNodeParameter.mockImplementation((parameterName: string) => {
+					if (parameterName === 'operation') {
+						return 'list';
+					}
+					if (parameterName === 'resource') {
+						return 'file';
+					}
+					if (parameterName === 'filePath') {
+						return 'path/to/file/';
+					}
+					if (parameterName === 'owner') {
+						return 'me';
+					}
+					if (parameterName === 'repository') {
+						return 'repo';
+					}
+					return '';
+				});
+
+				await githubNode.execute.call(mockExecutionContext);
+
+				expect(utilities.removeTrailingSlash).toHaveBeenCalledWith('path/to/file/');
+				expect(mockExecutionContext.helpers.requestWithAuthentication).toHaveBeenCalledWith(
+					'githubOAuth2Api',
+					{
+						body: {},
+						json: true,
+						method: 'GET',
+						qs: {},
+						uri: 'https://api.github.com/repos/me/repo/contents/path%2Fto%2Ffile',
+					},
+				);
+			});
 		});
 
 		beforeEach(async () => {
@@ -94,21 +162,21 @@ describe('Test Github Node', () => {
 		beforeEach(() => {
 			githubNode = new Github();
 			mockExecutionContext = {
-				getNode: jest.fn().mockReturnValue({ name: 'Github' }),
-				getNodeParameter: jest.fn(),
-				getInputData: jest.fn().mockReturnValue([{ json: {} }]),
-				continueOnFail: jest.fn().mockReturnValue(false),
-				putExecutionToWait: jest.fn(),
-				getCredentials: jest.fn().mockResolvedValue({
+				getNode: vi.fn().mockReturnValue({ name: 'Github' }),
+				getNodeParameter: vi.fn(),
+				getInputData: vi.fn().mockReturnValue([{ json: {} }]),
+				continueOnFail: vi.fn().mockReturnValue(false),
+				putExecutionToWait: vi.fn(),
+				getCredentials: vi.fn().mockResolvedValue({
 					server: 'https://api.github.com',
 					user: 'test',
 					accessToken: 'test',
 				}),
 				helpers: {
-					returnJsonArray: jest.fn().mockReturnValue([{ json: {} }]),
-					httpRequest: jest.fn(),
-					httpRequestWithAuthentication: jest.fn(),
-					requestWithAuthentication: jest
+					returnJsonArray: vi.fn().mockReturnValue([{ json: {} }]),
+					httpRequest: vi.fn(),
+					httpRequestWithAuthentication: vi.fn(),
+					requestWithAuthentication: vi
 						.fn()
 						.mockImplementation(async (_credentialType, options) => {
 							if (options.uri.includes('dispatches') && options.method === 'POST') {
@@ -119,12 +187,12 @@ describe('Test Github Node', () => {
 							}
 							return {};
 						}),
-					request: jest.fn(),
-					constructExecutionMetaData: jest.fn().mockReturnValue([{ json: {} }]),
-					assertBinaryData: jest.fn(),
-					prepareBinaryData: jest.fn(),
+					request: vi.fn(),
+					constructExecutionMetaData: vi.fn().mockReturnValue([{ json: {} }]),
+					assertBinaryData: vi.fn(),
+					prepareBinaryData: vi.fn(),
 				},
-				getWorkflowDataProxy: jest.fn().mockReturnValue({
+				getWorkflowDataProxy: vi.fn().mockReturnValue({
 					$execution: {
 						resumeUrl: 'https://example.com/webhook',
 					},
@@ -245,7 +313,7 @@ describe('Test Github Node', () => {
 			const repository = 'testRepository';
 			const workflowId = 147025216;
 
-			mockExecutionContext.getWorkflowDataProxy = jest.fn().mockReturnValue({
+			mockExecutionContext.getWorkflowDataProxy = vi.fn().mockReturnValue({
 				$execution: {
 					resumeUrl: 'https://example.com/webhook',
 				},
@@ -313,19 +381,19 @@ describe('Test Github Node', () => {
 		beforeEach(() => {
 			githubNode = new Github();
 			mockExecutionContext = {
-				getNode: jest.fn().mockReturnValue({ name: 'Github' }),
-				getNodeParameter: jest.fn(),
-				getInputData: jest.fn().mockReturnValue([{ json: {} }]),
-				continueOnFail: jest.fn().mockReturnValue(false),
-				getCredentials: jest.fn().mockResolvedValue({
+				getNode: vi.fn().mockReturnValue({ name: 'Github' }),
+				getNodeParameter: vi.fn(),
+				getInputData: vi.fn().mockReturnValue([{ json: {} }]),
+				continueOnFail: vi.fn().mockReturnValue(false),
+				getCredentials: vi.fn().mockResolvedValue({
 					server: 'https://api.github.com',
 					user: 'test',
 					accessToken: 'test',
 				}),
 				helpers: {
-					returnJsonArray: jest.fn().mockReturnValue([{ json: {} }]),
-					requestWithAuthentication: jest.fn().mockResolvedValue({}),
-					constructExecutionMetaData: jest.fn().mockReturnValue([{ json: {} }]),
+					returnJsonArray: vi.fn().mockReturnValue([{ json: {} }]),
+					requestWithAuthentication: vi.fn().mockResolvedValue({}),
+					constructExecutionMetaData: vi.fn().mockReturnValue([{ json: {} }]),
 				},
 			};
 		});
@@ -523,6 +591,111 @@ describe('Test Github Node', () => {
 					expect.objectContaining({ value: 'get' }),
 					expect.objectContaining({ value: 'getUsage' }),
 				]),
+			);
+		});
+	});
+
+	describe('User Operations', () => {
+		let githubNode: Github;
+		let mockExecutionContext: any;
+
+		beforeEach(() => {
+			githubNode = new Github();
+			mockExecutionContext = {
+				getNode: vi.fn().mockReturnValue({ name: 'Github' }),
+				getNodeParameter: vi.fn(),
+				getInputData: vi.fn().mockReturnValue([{ json: {} }]),
+				continueOnFail: vi.fn().mockReturnValue(false),
+				getCredentials: vi.fn().mockResolvedValue({
+					server: 'https://api.github.com',
+					user: 'test',
+					accessToken: 'test',
+				}),
+				helpers: {
+					returnJsonArray: vi.fn().mockReturnValue([{ json: {} }]),
+					requestWithAuthentication: vi.fn().mockResolvedValue({}),
+					constructExecutionMetaData: vi.fn().mockReturnValue([{ json: {} }]),
+				},
+			};
+		});
+
+		it('should fetch open issues by default (user:getIssues)', async () => {
+			mockExecutionContext.getNodeParameter.mockImplementation((parameterName: string) => {
+				if (parameterName === 'resource') return 'user';
+				if (parameterName === 'operation') return 'getUserIssues';
+				if (parameterName === 'getUserIssuesFilters') return {};
+				if (parameterName === 'returnAll') return true;
+				if (parameterName === 'authentication') return 'accessToken';
+				return '';
+			});
+			mockExecutionContext.helpers.requestWithAuthentication.mockResolvedValue({
+				body: [
+					{ id: 1, title: 'Issue 1', state: 'open' },
+					{ id: 2, title: 'Issue 2', state: 'open' },
+				],
+				headers: {},
+			});
+
+			await githubNode.execute.call(mockExecutionContext);
+			expect(mockExecutionContext.helpers.requestWithAuthentication).toHaveBeenCalledWith(
+				expect.any(String),
+				expect.objectContaining({
+					method: 'GET',
+					uri: 'https://api.github.com/issues',
+					qs: expect.not.objectContaining({ state: 'closed' }),
+				}),
+			);
+		});
+
+		it('should fetch closed issues when state filter is set to closed (user:getIssues)', async () => {
+			mockExecutionContext.getNodeParameter.mockImplementation((parameterName: string) => {
+				if (parameterName === 'resource') return 'user';
+				if (parameterName === 'operation') return 'getUserIssues';
+				if (parameterName === 'getUserIssuesFilters') return { state: 'closed' };
+				if (parameterName === 'returnAll') return true;
+				if (parameterName === 'authentication') return 'accessToken';
+				return '';
+			});
+
+			mockExecutionContext.helpers.requestWithAuthentication.mockResolvedValue({
+				body: [{ id: 3, title: 'Issue 3', state: 'closed' }],
+				headers: {},
+			});
+
+			await githubNode.execute.call(mockExecutionContext);
+			expect(mockExecutionContext.helpers.requestWithAuthentication).toHaveBeenCalledWith(
+				expect.any(String),
+				expect.objectContaining({
+					method: 'GET',
+					uri: 'https://api.github.com/issues',
+					qs: expect.objectContaining({ state: 'closed' }),
+				}),
+			);
+		});
+
+		it('should fetch issues with a specific label (user:getIssues)', async () => {
+			mockExecutionContext.getNodeParameter.mockImplementation((parameterName: string) => {
+				if (parameterName === 'resource') return 'user';
+				if (parameterName === 'operation') return 'getUserIssues';
+				if (parameterName === 'getUserIssuesFilters') return { labels: 'bug' };
+				if (parameterName === 'returnAll') return true;
+				if (parameterName === 'authentication') return 'accessToken';
+				return '';
+			});
+
+			mockExecutionContext.helpers.requestWithAuthentication.mockResolvedValue({
+				body: [{ id: 4, title: 'Issue 4', state: 'open', labels: ['bug'] }],
+				headers: {},
+			});
+
+			await githubNode.execute.call(mockExecutionContext);
+			expect(mockExecutionContext.helpers.requestWithAuthentication).toHaveBeenCalledWith(
+				expect.any(String),
+				expect.objectContaining({
+					method: 'GET',
+					uri: 'https://api.github.com/issues',
+					qs: expect.objectContaining({ labels: 'bug' }),
+				}),
 			);
 		});
 	});

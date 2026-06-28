@@ -1,5 +1,4 @@
-import { Container } from '@n8n/di';
-import { get } from 'lodash';
+import get from 'lodash/get';
 import type {
 	Workflow,
 	INode,
@@ -14,6 +13,8 @@ import type {
 	IExecuteWorkflowInfo,
 	RelatedExecution,
 	ExecuteWorkflowData,
+	ExecuteAgentInfo,
+	ExecuteAgentData,
 	ITaskMetadata,
 	ContextType,
 	IContextObject,
@@ -21,22 +22,25 @@ import type {
 	ISourceData,
 	AiEvent,
 	NodeConnectionType,
+	Result,
+	IExecuteFunctions,
+	ExecuteAgentWorkflowContext,
 } from 'n8n-workflow';
 import {
-	ApplicationError,
+	UnexpectedError,
+	OperationalError,
 	NodeHelpers,
 	NodeConnectionTypes,
 	WAIT_INDEFINITELY,
 	WorkflowDataProxy,
+	createEnvProviderState,
 } from 'n8n-workflow';
 
-import { BinaryDataService } from '@/binary-data/binary-data.service';
+import { PLACEHOLDER_EMPTY_EXECUTION_ID } from '@/constants';
 
 import { NodeExecutionContext } from './node-execution-context';
 
 export class BaseExecuteContext extends NodeExecutionContext {
-	protected readonly binaryDataService = Container.get(BinaryDataService);
-
 	constructor(
 		workflow: Workflow,
 		node: INode,
@@ -50,6 +54,10 @@ export class BaseExecuteContext extends NodeExecutionContext {
 		readonly abortSignal?: AbortSignal,
 	) {
 		super(workflow, node, additionalData, mode, runExecutionData, runIndex);
+	}
+
+	getExecutionContext() {
+		return this.runExecutionData.executionData?.runtimeData;
 	}
 
 	getExecutionCancelSignal() {
@@ -116,8 +124,24 @@ export class BaseExecuteContext extends NodeExecutionContext {
 		options?: {
 			doNotWaitToFinish?: boolean;
 			parentExecution?: RelatedExecution;
+			executionMode?: WorkflowExecuteMode;
+			returnLastRunOnly?: boolean;
 		},
 	): Promise<ExecuteWorkflowData> {
+		if (options?.parentExecution) {
+			// Inject the current execution context into the direct parent's
+			// sub-workflow only. Normalize against the placeholder id: during a
+			// trigger's webhook phase (e.g. an MCP Trigger tool call) no execution id
+			// exists yet, so `getExecutionId()` is `undefined` while the proxied
+			// `parentExecution.executionId` is `PLACEHOLDER_EMPTY_EXECUTION_ID`.
+			if (
+				!options.parentExecution.executionContext &&
+				options.parentExecution.executionId ===
+					(this.getExecutionId() ?? PLACEHOLDER_EMPTY_EXECUTION_ID)
+			) {
+				options.parentExecution.executionContext = this.getExecutionContext();
+			}
+		}
 		const result = await this.additionalData.executeWorkflow(workflowInfo, this.additionalData, {
 			...options,
 			parentWorkflowId: this.workflow.id,
@@ -134,25 +158,72 @@ export class BaseExecuteContext extends NodeExecutionContext {
 			await this.putExecutionToWait(WAIT_INDEFINITELY);
 		}
 
-		const data = await this.binaryDataService.duplicateBinaryData(
-			this.workflow.id,
-			this.additionalData.executionId!,
-			result.data,
+		return result;
+	}
+
+	async executeAgent(
+		agentInfo: ExecuteAgentInfo,
+		message: string,
+		executionId: string,
+		itemIndex: number,
+	): Promise<ExecuteAgentData> {
+		if (!this.additionalData.executeAgent) {
+			throw new OperationalError('Agent execution is not available in this context');
+		}
+
+		const threadId = agentInfo.sessionId?.trim() || `${executionId}-${itemIndex}`;
+
+		const inputDataScope = agentInfo.inputDataScope ?? 'item';
+		const mainBranches = this.inputData?.main ?? [];
+		const primaryBranch = mainBranches[0] ?? [];
+		// 'all' exposes every input item across all main branches; otherwise scope
+		// to the current item from the primary branch (empty when itemIndex is out
+		// of range — defensive).
+		const scopedInput =
+			inputDataScope === 'all'
+				? mainBranches.flatMap((branch) => branch ?? [])
+				: itemIndex < primaryBranch.length
+					? [primaryBranch[itemIndex]]
+					: [];
+
+		const workflowContext: ExecuteAgentWorkflowContext = {
+			workflowId: this.workflow.id,
+			workflowName: this.workflow.name,
+			callingNodeName: this.node.name,
+			inputData: scopedInput,
+			inputDataScope,
+			exposeWorkflowData: agentInfo.exposeWorkflowData ?? false,
+			nodes: Object.values(this.workflow.nodes).map(({ name, type }) => ({ name, type })),
+			runExecutionData: this.runExecutionData,
+		};
+
+		return await this.additionalData.executeAgent(
+			agentInfo.agentId,
+			message,
+			executionId,
+			threadId,
+			this.additionalData,
+			this.additionalData.rootExecutionMode ?? this.getMode(),
+			agentInfo.outputSchema,
+			workflowContext,
 		);
-		return { ...result, data };
+	}
+
+	async getExecutionDataById(executionId: string): Promise<IRunExecutionData | undefined> {
+		return await this.additionalData.getRunExecutionData(executionId);
 	}
 
 	protected getInputItems(inputIndex: number, connectionType: NodeConnectionType) {
 		const inputData = this.inputData[connectionType];
 		if (inputData.length < inputIndex) {
-			throw new ApplicationError('Could not get input with given index', {
+			throw new UnexpectedError('Could not get input with given index', {
 				extra: { inputIndex, connectionType },
 			});
 		}
 
 		const allItems = inputData[inputIndex] as INodeExecutionData[] | null | undefined;
 		if (allItems === null) {
-			throw new ApplicationError('Input index was not set', {
+			throw new UnexpectedError('Input index was not set', {
 				extra: { inputIndex, connectionType },
 			});
 		}
@@ -163,7 +234,7 @@ export class BaseExecuteContext extends NodeExecutionContext {
 	getInputSourceData(inputIndex = 0, connectionType = NodeConnectionTypes.Main): ISourceData {
 		if (this.executeData?.source === null) {
 			// Should never happen as n8n sets it automatically
-			throw new ApplicationError('Source data is missing');
+			throw new UnexpectedError('Source data is missing');
 		}
 		return this.executeData.source[connectionType][inputIndex]!;
 	}
@@ -224,5 +295,34 @@ export class BaseExecuteContext extends NodeExecutionContext {
 			workflowId: this.workflow.id ?? 'unsaved-workflow',
 			msg,
 		});
+	}
+
+	async startJob<T = unknown, E = unknown>(
+		jobType: string,
+		settings: unknown,
+		itemIndex: number,
+	): Promise<Result<T, E>> {
+		return await this.additionalData.startRunnerTask<T, E>(
+			this.additionalData,
+			jobType,
+			settings,
+			this as IExecuteFunctions,
+			this.inputData,
+			this.node,
+			this.workflow,
+			this.runExecutionData,
+			this.runIndex,
+			itemIndex,
+			this.node.name,
+			this.connectionInputData,
+			{},
+			this.mode,
+			createEnvProviderState(),
+			this.executeData,
+		);
+	}
+
+	getRunnerStatus(taskType: string): { available: true } | { available: false; reason?: string } {
+		return this.additionalData.getRunnerStatus?.(taskType) ?? { available: true };
 	}
 }

@@ -34,6 +34,10 @@ export class Logger implements LoggerType {
 	/** https://no-color.org/ */
 	private readonly noColor = process.env.NO_COLOR !== undefined && process.env.NO_COLOR !== '';
 
+	// Allow opt-in coloring in production by setting NO_COLOR to 'false' or '0'
+	private readonly noColorDefaultTrue =
+		process.env.NO_COLOR !== 'false' && process.env.NO_COLOR !== '0';
+
 	constructor(
 		private readonly globalConfig: GlobalConfig,
 		private readonly instanceSettingsConfig: InstanceSettingsConfig,
@@ -81,6 +85,27 @@ export class Logger implements LoggerType {
 		return scopedLogger;
 	}
 
+	private serializeError(
+		error: unknown,
+		seen: Set<unknown> = new Set(),
+	): { name: string; message: string; stack?: string; cause: unknown } | string {
+		if (!(error instanceof Error)) return String(error);
+
+		// prevent infinite recursion
+		let cause: unknown;
+		if (error.cause && !seen.has(error.cause)) {
+			seen.add(error.cause);
+			cause = this.serializeError(error.cause, seen);
+		}
+
+		return {
+			name: error.name,
+			message: error.message,
+			stack: error.stack,
+			cause,
+		};
+	}
+
 	private log(level: LogLevel, message: string, metadata: LogMetadata) {
 		const location: LogLocationMetadata = {};
 
@@ -90,6 +115,13 @@ export class Logger implements LoggerType {
 			location.file = basename(caller.getFileName() ?? '');
 			const fnName = caller.getFunctionName();
 			if (fnName) location.function = fnName;
+		}
+
+		for (const key of Object.keys(metadata)) {
+			const value = metadata[key];
+			if (value instanceof Error) {
+				metadata[key] = this.serializeError(value);
+			}
 		}
 
 		this.internalLogger.log(level, message, { ...metadata, ...location });
@@ -107,13 +139,29 @@ export class Logger implements LoggerType {
 		}
 	}
 
+	private jsonConsoleFormat() {
+		return winston.format.combine(
+			winston.format.timestamp(),
+			winston.format.metadata(),
+			winston.format.json(),
+			this.scopeFilter(),
+		);
+	}
+
+	private pickConsoleTransportFormat() {
+		if (this.globalConfig.logging.format === 'json') {
+			return this.jsonConsoleFormat();
+		} else if (this.level === 'debug' && inDevelopment) {
+			return this.debugDevConsoleFormat();
+		} else if (this.level === 'debug' && inProduction) {
+			return this.debugProdConsoleFormat();
+		} else {
+			return winston.format.printf(({ message }: { message: string }) => message);
+		}
+	}
+
 	private setConsoleTransport() {
-		const format =
-			this.level === 'debug' && inDevelopment
-				? this.debugDevConsoleFormat()
-				: this.level === 'debug' && inProduction
-					? this.debugProdConsoleFormat()
-					: winston.format.printf(({ message }: { message: string }) => message);
+		const format = this.pickConsoleTransportFormat();
 
 		this.internalLogger.add(new winston.transports.Console({ format }));
 	}
@@ -131,7 +179,13 @@ export class Logger implements LoggerType {
 		})();
 	}
 
-	private color() {
+	private color(defaultToTrue: boolean = false) {
+		if (defaultToTrue) {
+			return this.noColorDefaultTrue
+				? winston.format.uncolorize()
+				: winston.format.colorize({ all: true });
+		}
+		// For development: respect NO_COLOR, otherwise colorize
 		return this.noColor ? winston.format.uncolorize() : winston.format.colorize({ all: true });
 	}
 
@@ -155,7 +209,7 @@ export class Logger implements LoggerType {
 		return winston.format.combine(
 			winston.format.metadata(),
 			winston.format.timestamp(),
-			this.color(),
+			this.color(true), // Default to no colors in production
 			this.scopeFilter(),
 			winston.format.printf(({ level, message, timestamp, metadata: rawMetadata }) => {
 				const metadata = this.toPrintable(rawMetadata);
@@ -189,12 +243,6 @@ export class Logger implements LoggerType {
 	}
 
 	private setFileTransport() {
-		const format = winston.format.combine(
-			winston.format.timestamp(),
-			winston.format.metadata(),
-			winston.format.json(),
-		);
-
 		const filename = path.isAbsolute(this.globalConfig.logging.file.location)
 			? this.globalConfig.logging.file.location
 			: path.join(this.instanceSettingsConfig.n8nFolder, this.globalConfig.logging.file.location);
@@ -204,7 +252,7 @@ export class Logger implements LoggerType {
 		this.internalLogger.add(
 			new winston.transports.File({
 				filename,
-				format,
+				format: this.jsonConsoleFormat(),
 				maxsize: fileSizeMax * 1_048_576, // config * 1 MiB in bytes
 				maxFiles: fileCountMax,
 			}),
